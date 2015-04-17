@@ -146,19 +146,17 @@ object SubGraph {
                 Edge(src._1, dst._1, w)
         }
 
-        val vertices_dirty: RDD[(VertexId, String)] = edge_tripl.flatMap {
-            case (src, dst, w) =>
-                List((src._1, src._2), (dst._1, dst._2))
-        }
-
-        val g = Graph(vertices_dirty, edges, "")
-
-        val vertices = g.vertices
+        val g = Graph.fromEdges(edges, "")
 
         val labled_components = ConnectedComponents.run(g)
         //获取节点属性（名称，发帖数量）//两种模式
         def vertices_vd(mode: String): RDD[(VertexId, (String, Long))] = mode.length match {
             case 0 => {
+                val vertices_dirty: RDD[(VertexId, String)] = edge_tripl.flatMap {
+                    case (src, dst, w) =>
+                        List((src._1, src._2), (dst._1, dst._2))
+                }
+                val vertices = vertices_dirty.reduceByKey((a, b) => a);
                 //从边集文件统计发帖数量（无向）
                 val vertices_weight: RDD[(VertexId, Long)] = verticeWeight(labled_components)
                 vertices.leftOuterJoin(vertices_weight).map {
@@ -183,12 +181,15 @@ object SubGraph {
             case (label, (cw, vw)) =>
                 val arr = Array.fill[String](2 + vw.size)("")
                 arr(0) = vw.size.toString
-                arr(1) = cw.toString
+                // arr(1) = cw.toString
                 var i = 2
+                var total = 0L
                 for (v <- vw) {
                     arr(i) = v._1 + ":" + v._2
                     i += 1
+                    total += v._2
                 }
+                arr(1) = total.toString
                 arr.mkString(",")
         }
         arrayMap.saveAsTextFile(dst)
@@ -223,7 +224,8 @@ object SubGraph {
         //vw:Iterator[(name,numberOfPost)]
         val result = component_weight.leftOuterJoin(group_vertices).map {
             case (label, (cw, vw)) =>
-                (label, (cw, vw.getOrElse(Iterator.empty)))
+                val it = vw.getOrElse(Iterator.empty)
+                (label, (cw, it))
         }
         result
     }
@@ -300,8 +302,9 @@ object SubGraph {
      */
     def merge(srcPath: String, dstPath: String): Unit = {
         val hadoopConfig = new Configuration()
-        val hdfs = FileSystem.get(hadoopConfig)
-        FileUtil.copyMerge(hdfs, new Path(srcPath), hdfs, new Path(dstPath), false, hadoopConfig, null)
+        // val hdfs = FileSystem.get(hadoopConfig)
+        val fs = FileSystem.getLocal(hadoopConfig)
+        FileUtil.copyMerge(fs, new Path(srcPath), fs, new Path(dstPath), false, hadoopConfig, null)
     }
 }
 
