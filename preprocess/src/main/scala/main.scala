@@ -133,53 +133,7 @@ object SubGraph {
 
     def connectedComponents(sc: SparkContext, src: String, dst: String, verticeFile: String = "") {
 
-        val edge_tripl = sc.textFile(src).map { x =>
-            val arr = x.split(",").map(e => e.trim)
-            ((nameHash(arr(2)), arr(2)), (nameHash(arr(4)), arr(4)), x(5).toLong)
-        }
-        //val empty_removed = edge_tripl.filter(x => x._1 != "0" && x._2 != "0")
-        // println("connectedComponents")
-        // println("edges count : " + edge_tripl.count())
-
-        val edges = edge_tripl.map {
-            case (src, dst, w) =>
-                Edge(src._1, dst._1, w)
-        }
-
-        val vertices_dirty: RDD[(VertexId, String)] = edge_tripl.flatMap {
-            case (src, dst, w) =>
-                List((src._1, src._2), (dst._1, dst._2))
-        }
-        val vertices = vertices_dirty.reduceByKey((a, b) => a);
-
-        val g = Graph(vertices, edges, "")
-
-        val labled_components = ConnectedComponents.run(g)
-        //获取节点属性（名称，发帖数量）//两种模式
-        def vertices_vd(mode: String): RDD[(VertexId, (String, Long))] = mode.length match {
-            case 0 => {
-
-                //从边集文件统计发帖数量（无向）
-                val vertices_weight: RDD[(VertexId, Long)] = verticeWeight(labled_components)
-                vertices.leftOuterJoin(vertices_weight).map {
-                    case (id, (name, wOps)) =>
-                        (id, (name, wOps.getOrElse(0L)))
-                }
-            }
-            case _ => {
-                //从定点集文件获取属性
-                val file = sc.textFile(mode)
-                val vertices_weight = verticeWeightFromFile(file)
-                vertices.leftOuterJoin(vertices_weight).map {
-                    case (id, (name, wOps)) =>
-                        (id, (name, wOps.getOrElse(0L)))
-                }
-            }
-        }
-
-        val vertices_weight = vertices_vd(verticeFile)
-
-        val result = extractEachComponentByVertice(labled_components, vertices_weight)
+        val result = computeAndMerge(sc, src, dst, verticeFile)
         //排序
         val sorted = result.sortBy(x => x._2._2.size)
         //格式化输出
@@ -201,6 +155,58 @@ object SubGraph {
         arrayMap.saveAsTextFile(dst)
         merge(dst, dst + ".txt")
 
+    }
+
+    def computeAndMerge(sc: SparkContext, src: String, dst: String, verticeFile: String = "") = {
+        val edge_tripl = sc.textFile(src).map { x =>
+            val arr = x.split(",").map(e => e.trim)
+            ((nameHash(arr(2)), arr(2)), (nameHash(arr(4)), arr(4)), x(5).toLong)
+        }
+
+        val edges = edge_tripl.map {
+            case (src, dst, w) =>
+                Edge(src._1, dst._1, w)
+        }
+
+        val g = Graph.fromEdges(edges, "")
+
+        val labled_components = ConnectedComponents.run(g)
+
+        val vertices_weight = vertices_vd(sc, verticeFile, labled_components, edge_tripl)
+
+        extractEachComponentByVertice(labled_components, vertices_weight)
+
+    }
+
+    //获取节点属性（名称，发帖数量）//两种模式
+    def vertices_vd(sc: SparkContext, mode: String, labled_components: Graph[Long, Long], edge_tripl: RDD[((Long, String), (Long, String), Long)]): RDD[(VertexId, (String, Long))] = mode.length match {
+        case 0 => {
+            val vertices_dirty: RDD[(VertexId, String)] = edge_tripl.flatMap {
+                case (src, dst, w) =>
+                    List((src._1, src._2), (dst._1, dst._2))
+            }
+            val vertices = vertices_dirty.reduceByKey((a, b) => a);
+            //从边集文件统计发帖数量（无向）
+            val vertices_weight: RDD[(VertexId, Long)] = verticeWeight(labled_components)
+            vertices.leftOuterJoin(vertices_weight).map {
+                case (id, (name, wOps)) =>
+                    (id, (name, wOps.getOrElse(0L)))
+            }
+        }
+        case _ => {
+            val vertices_dirty: RDD[(VertexId, String)] = edge_tripl.flatMap {
+                case (src, dst, w) =>
+                    List((src._1, src._2), (dst._1, dst._2))
+            }
+            val vertices = vertices_dirty.reduceByKey((a, b) => a);
+            //从定点集文件获取属性
+            val file = sc.textFile(mode)
+            val vertices_weight = verticeWeightFromFile(file)
+            vertices.leftOuterJoin(vertices_weight).map {
+                case (id, (name, wOps)) =>
+                    (id, (name, wOps.getOrElse(0L)))
+            }
+        }
     }
 
     // Hash function to assign an Id to each article
