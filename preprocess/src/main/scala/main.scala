@@ -20,7 +20,7 @@ object SubGraph {
 
     def main(args: Array[String]) {
 
-        val conf = new SparkConf().setAppName("Simple Application")
+        val conf = new SparkConf().setAppName("Components")
         val sc = new SparkContext(conf)
 
         if (args.length < 1) {
@@ -135,22 +135,11 @@ object SubGraph {
 
         val result = computeAndMerge(sc, src, dst, verticeFile)
         //排序
-        val sorted = result.sortBy(x => x._2._2.size)
+        val sorted = result.sortBy(x => x._1)
         //格式化输出
         val arrayMap = sorted.map {
-            case (label, (cw, vw)) =>
-                val arr = Array.fill[String](2 + vw.size)("")
-                arr(0) = vw.size.toString
-                // arr(1) = cw.toString
-                var i = 2
-                var total = 0L
-                for (v <- vw) {
-                    arr(i) = v._1 + ":" + v._2
-                    i += 1
-                    total += v._2
-                }
-                arr(1) = total.toString
-                arr.mkString(",")
+            case (vNo, (pNo, member)) =>
+                vNo.toString + "," + pNo.toString + "," + member
         }
         arrayMap.saveAsTextFile(dst)
         merge(dst, dst + ".txt")
@@ -158,10 +147,12 @@ object SubGraph {
     }
 
     def computeAndMerge(sc: SparkContext, src: String, dst: String, verticeFile: String = "") = {
-        val edge_tripl = sc.textFile(src).map { x =>
-            val arr = x.split(",").map(e => e.trim)
-            ((nameHash(arr(2)), arr(2)), (nameHash(arr(4)), arr(4)), x(5).toLong)
-        }
+        val edge_tripl = sc.textFile(src)
+            .distinct(500)
+            .map { x =>
+                val arr = x.split(",").map(e => e.trim)
+                ((nameHash(arr(2)), arr(2)), (nameHash(arr(4)), arr(4)), x(5).toLong)
+            }
 
         val edges = edge_tripl.map {
             case (src, dst, w) =>
@@ -200,7 +191,7 @@ object SubGraph {
             }
             val vertices = vertices_dirty.reduceByKey((a, b) => a);
             //从定点集文件获取属性
-            val file = sc.textFile(mode)
+            val file = sc.textFile(mode).distinct(200)
             val vertices_weight = verticeWeightFromFile(file)
             vertices.leftOuterJoin(vertices_weight).map {
                 case (id, (name, wOps)) =>
@@ -221,25 +212,29 @@ object SubGraph {
                 val vd = vdOps.getOrElse(("Not found", 0L))
                 (label, (vd._1, vd._2))
         }
-        // val vertices_merge = merged_vertice.leftOuterJoin(vertices_weight).map {
-        //     case (id, ((label, name), vw)) =>
-        //         (label, (name, vw.getOrElse(0L)))
-        // }
-        val group_vertices = merged_vertice.groupByKey()
 
-        val group_edges = labled_components.triplets.map(x => (x.srcAttr, x.attr))
-
-        val component_weight = group_edges.reduceByKey((a, b) => (a + b))
-
-        //label:component id
-        //cw:total post in component
-        //vw:Iterator[(name,numberOfPost)]
-        val result = component_weight.leftOuterJoin(group_vertices).map {
-            case (label, (cw, vw)) =>
-                val it = vw.getOrElse(Iterator.empty)
-                (label, (cw, it))
+        val membersOfGroup = merged_vertice.reduceByKey {
+            case (v1, v2) =>
+                if (v2._2 < 0 && v1._2 < 0) {
+                    (v1._1 + "," + v2._1, v1._2 + v2._2)
+                } else if (v1._2 < 0 && v2._2 >= 0) {
+                    (v1._1 + "," + v2._1 + ":" + v2._2, v1._2 - 1)
+                } else if (v1._2 >= 0 && v2._2 < 0) {
+                    (v2._1 + "," + v1._1 + ":" + v1._2, v2._2 - 1)
+                } else {
+                    //(v1._2 >= 0 && v2._2 >= 0)
+                    (v1._1 + ":" + v1._2 + "," + v2._1 + ":" + v2._2, -2)
+                }
         }
-        result
+
+        val postOfGroup = merged_vertice.reduceByKey((v1, v2) => (v1._1, v1._2 + v2._2))
+
+        postOfGroup.leftOuterJoin(membersOfGroup).map {
+            case (label, (post, memberOps)) =>
+                val mOps = memberOps.getOrElse(("missing[ERROR]", -1L))
+                ((mOps._2 * (-1L)), (post._2, mOps._1))
+        }
+
     }
 
     /**
