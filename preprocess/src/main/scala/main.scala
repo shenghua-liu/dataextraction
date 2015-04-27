@@ -41,7 +41,8 @@ object SubGraph {
             }
             case "3" => {
                 if (args.length >= 4) {
-                    joinTable(sc, args(1), args(2), args(3))
+                    // joinTable(sc, args(1), args(2), args(3))
+                    recover_id(sc, args(1), args(2), args(3))
                 }
             }
             case "4" => {
@@ -79,9 +80,30 @@ object SubGraph {
         merge(dst, dst + ".csv")
     }
 
+    def recover_id(sc: SparkContext, src_vertice: String, src_relation: String, dst: String) {
+        val lines_post = sc.textFile(src_vertice).distinct(100)
+        val lines_relation = sc.textFile(src_relation).distinct(100)
+        val vertices_in_post = lines_post.map(x => x.split(",").map(ele => ele.trim)).map(x => (nameHash(x(1)), x(0))) //VertexId,String(id)
+        val lines_arr = lines_relation.map(x => x.split(",").map(ele => ele.trim)).cache()
+        val triplets = lines_arr.map(x => Edge(nameHash(x(2)), nameHash(x(4)), (x(0), x(5)))) //Edge(Vid,Vid,(MD5,count))
+        val vertices_dirty = lines_arr.flatMap {
+            case arr =>
+                List((nameHash(arr(2)), (arr(1), arr(2))), (nameHash(arr(4)), (arr(3), arr(4)))) //(VertexId,(id,name))
+        }
+        val vertices_in_edges = vertices_dirty.reduceByKey((a, b) => a);
+        val graph = Graph(vertices_in_edges, triplets, ("MD5", "COUNT")) //default value of vertex
+        val recovergraph = graph.outerJoinVertices(vertices_in_post) {
+            case (vid, pathVD, postVDOps) =>
+                val id = postVDOps.getOrElse(pathVD._1)
+                (id, pathVD._2)
+        }
+        recovergraph.triplets.map(x => Array(x.attr._1, x.srcAttr._1, x.srcAttr._2, x.dstAttr._1, x.dstAttr._2, x.attr._2).mkString(",")).saveAsTextFile(dst)
+        merge(dst, dst + ".csv")
+    }
+
     def joinTable(sc: SparkContext, src_vertice: String, src_relation: String, dst: String) {
-        val lines_post = sc.textFile(src_vertice)
-        val lines_relation = sc.textFile(src_relation)
+        val lines_post = sc.textFile(src_vertice).distinct(2)
+        val lines_relation = sc.textFile(src_relation).distinct(2)
 
         val rows_post = lines_post.map(x => x.split(",").map(ele => ele.trim))
         val rows_relation = lines_relation.map(x => x.split(",").map(ele => ele.trim))
@@ -148,7 +170,7 @@ object SubGraph {
 
     def computeAndMerge(sc: SparkContext, src: String, dst: String, verticeFile: String = "") = {
         val edge_tripl = sc.textFile(src)
-            .distinct(500)
+            .distinct(6)
             .map { x =>
                 val arr = x.split(",").map(e => e.trim)
                 ((nameHash(arr(2)), arr(2)), (nameHash(arr(4)), arr(4)), x(5).toLong)
