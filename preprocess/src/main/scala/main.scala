@@ -1,6 +1,7 @@
 import org.apache.spark.SparkContext
 import org.apache.spark.SparkContext._
 import org.apache.spark.SparkConf
+import org.apache.spark.Logging
 import org.apache.spark.rdd.RDD
 import java.io.File
 import org.apache.hadoop.conf.Configuration
@@ -11,7 +12,7 @@ import org.apache.spark.graphx._
 import com.typesafe.config._
 import simplelib._
 
-object SubGraph {
+object SubGraph extends Logging {
 
     // Load our own config values from the default location, application.conf
     val conf = ConfigFactory.load()
@@ -21,8 +22,9 @@ object SubGraph {
     def main(args: Array[String]) {
 
         val conf = new SparkConf().setAppName("Components")
-        val sc = new SparkContext(conf)
 
+        val sc = new SparkContext(conf)
+        sc.setCheckpointDir("/tmp")
         if (args.length < 1) {
             println("【参数一】运行程序编号，【参数...】");
             return
@@ -41,7 +43,7 @@ object SubGraph {
             }
             case "3" => {
                 if (args.length >= 4) {
-                    // joinTable(sc, args(1), args(2), args(3))
+                    //joinTable(sc, args(1), args(2), args(3))
                     recover_id(sc, args(1), args(2), args(3))
                 }
             }
@@ -53,12 +55,28 @@ object SubGraph {
                     connectedComponents(sc, args(1), args(2), args(3))
                 }
             }
+            case "5" => {
+                if (args.length == 4) {
+                    diff(sc, args(1), args(2), args(3))
+                }
+            }
+            case "6" => {
+                if (args.length == 3) {
+                    components(sc, args(1), args(2))
+                }
+            }
+            case "7" => {
+                if (args.length == 3) {
+                    hash2minComponents(sc, args(1), args(2))
+                }
+            }
             case _ => {
                 println("【1】：清理节点；【2】：清理边；【3】：补充Id；【4】：求子图 （填入【】中数字）")
             }
         }
 
-        task(args(0));
+        task(args(0))
+        sc.stop()
     }
 
     def remove_repeating_vertice(sc: SparkContext, src: String, dst: String) {
@@ -81,10 +99,10 @@ object SubGraph {
     }
 
     def recover_id(sc: SparkContext, src_vertice: String, src_relation: String, dst: String) {
-        val lines_post = sc.textFile(src_vertice).distinct(100)
-        val lines_relation = sc.textFile(src_relation).distinct(100)
+        val lines_post = sc.textFile(src_vertice)
+        val lines_relation = sc.textFile(src_relation)
         val vertices_in_post = lines_post.map(x => x.split(",").map(ele => ele.trim)).map(x => (nameHash(x(1)), x(0))) //VertexId,String(id)
-        val lines_arr = lines_relation.map(x => x.split(",").map(ele => ele.trim)).cache()
+        val lines_arr = lines_relation.map(x => x.split(",").map(ele => ele.trim))
         val triplets = lines_arr.map(x => Edge(nameHash(x(2)), nameHash(x(4)), (x(0), x(5)))) //Edge(Vid,Vid,(MD5,count))
         val vertices_dirty = lines_arr.flatMap {
             case arr =>
@@ -94,16 +112,24 @@ object SubGraph {
         val graph = Graph(vertices_in_edges, triplets, ("MD5", "COUNT")) //default value of vertex
         val recovergraph = graph.outerJoinVertices(vertices_in_post) {
             case (vid, pathVD, postVDOps) =>
-                val id = postVDOps.getOrElse(pathVD._1)
-                (id, pathVD._2)
+                // val id = postVDOps.getOrElse(pathVD._1)
+                // (id, pathVD._2)
+                postVDOps match {
+                    case Some(x) => (x, pathVD._2, true)
+                    case None => (pathVD._1, pathVD._2, false)
+                }
+
         }
-        recovergraph.triplets.map(x => Array(x.attr._1, x.srcAttr._1, x.srcAttr._2, x.dstAttr._1, x.dstAttr._2, x.attr._2).mkString(",")).saveAsTextFile(dst)
-        merge(dst, dst + ".csv")
+        recovergraph.triplets.map(x => Array(x.attr._1, x.srcAttr._1, x.srcAttr._2, x.dstAttr._1, x.dstAttr._2, x.attr._2).mkString(",")).saveAsTextFile(dst + "/recover_reRelation")
+        recovergraph.vertices.filter(x => x._2._3 == false).map(x => Array(x._2._1, x._2._2, 0).mkString(",")).saveAsTextFile(dst + "/recover_bad_post")
+        merge(dst + "/recover_reRelation", dst + "/recover_reRelation.csv")
+        merge(dst + "/recover_bad_post", dst + "/recover_bad_post.csv")
+
     }
 
     def joinTable(sc: SparkContext, src_vertice: String, src_relation: String, dst: String) {
-        val lines_post = sc.textFile(src_vertice).distinct(2)
-        val lines_relation = sc.textFile(src_relation).distinct(2)
+        val lines_post = sc.textFile(src_vertice)
+        val lines_relation = sc.textFile(src_relation)
 
         val rows_post = lines_post.map(x => x.split(",").map(ele => ele.trim))
         val rows_relation = lines_relation.map(x => x.split(",").map(ele => ele.trim))
@@ -170,7 +196,7 @@ object SubGraph {
 
     def computeAndMerge(sc: SparkContext, src: String, dst: String, verticeFile: String = "") = {
         val edge_tripl = sc.textFile(src)
-            .distinct(6)
+            .distinct(600)
             .map { x =>
                 val arr = x.split(",").map(e => e.trim)
                 ((nameHash(arr(2)), arr(2)), (nameHash(arr(4)), arr(4)), x(5).toLong)
@@ -189,6 +215,146 @@ object SubGraph {
 
         extractEachComponentByVertice(labled_components, vertices_weight)
 
+    }
+
+    def components(sc: SparkContext, src: String, dst: String) {
+        logWarning("components !!!")
+        val edge_tripl = sc.textFile(src)
+            .distinct(300)
+            .map { x =>
+                val arr = x.split(",").map(e => e.trim)
+                ((nameHash(arr(2)), arr(2)), (nameHash(arr(4)), arr(4)), x(5).toLong)
+            }
+        logWarning("load file")
+
+        val edges = edge_tripl.map {
+            case (src, dst, w) =>
+                Edge(src._1, dst._1, w)
+        }
+
+        logWarning("edges")
+        val vertices_dirty: RDD[(VertexId, String)] = edge_tripl.flatMap {
+            case (src, dst, w) =>
+                List((src._1, src._2), (dst._1, dst._2))
+        }
+
+        logWarning("start component")
+        val graph = Graph(vertices_dirty, edges, "")
+        val vertices = graph.vertices
+        val g = ConnectedComponents.run(graph)
+        logWarning("end component")
+        val result = g.vertices.leftOuterJoin(vertices).map {
+            case (vid, (label, nameOps)) =>
+                val name = nameOps.getOrElse(vid)
+                Array(name, label).mkString(",")
+        }
+
+        result.saveAsTextFile(dst)
+        merge(dst, dst + ".csv")
+    }
+
+    def hash2minComponents(sc: SparkContext, src: String, dst: String) {
+        logWarning("hash2min")
+        val edge_tripl = sc.textFile(src)
+            .distinct(300)
+            .map { x =>
+                val arr = x.split(",").map(e => e.trim)
+                ((nameHash(arr(2)), arr(2)), (nameHash(arr(4)), arr(4)), x(5).toLong)
+            }
+        val edges = edge_tripl.map {
+            case (src, dst, w) =>
+                Edge(src._1, dst._1, w)
+        }
+        val graph = Graph.fromEdges(edges, "")
+        val init_vertices = graph.aggregateMessages[List[VertexId]](
+            triplet => {
+                triplet.sendToSrc(List(triplet.dstId))
+                triplet.sendToDst(List(triplet.srcId))
+            },
+            (a, b) => {
+                List.concat(a, b)
+            })
+        var cluster: VertexRDD[(Int, List[VertexId])] = init_vertices.mapValues((vid, nbs) => (1, nbs ::: List(vid))).cache()
+        //val maxInteration = Integer.max
+        var iteration = 1
+        var newCluster: VertexRDD[(Int, List[VertexId])] = null
+        //remove node whose cluster's length is 1
+        var tmp: VertexRDD[(Int, List[VertexId])] = cluster
+
+        var continue: Boolean = true
+        var preCount: Long = 0
+        while (iteration < 100 && continue) {
+            logWarning("hash2min iteration :" + iteration)
+            val mark = iteration
+            //send C(v) to min
+            val union_a_map = tmp.map {
+                case (vid, nbs) =>
+                    val minVertex = nbs._2.min
+                    (minVertex, nbs._2)
+            }
+            val union_a = union_a_map.reduceByKey((a, b) => a ::: b)
+
+            // logWarning("union_a count" + union_a.count())
+            //send {Vmin} to nbs
+            val union_b_map = tmp.flatMap {
+                case (vid, nbs) =>
+                    val minVertex = nbs._2.min
+                    for (child <- nbs._2) yield (child, List(minVertex))
+            }
+            val union_b = union_b_map.reduceByKey((a, b) => a ::: b)
+            // logWarning("union_b count" + union_b.count())
+            //merge msg
+            val union = union_a.fullOuterJoin(union_b).map {
+                case (target, (aOps, bOps)) =>
+                    val a = aOps.getOrElse(List())
+                    val b = bOps.getOrElse(List())
+                    (target, a ::: b)
+            }
+            // logWarning("union count" + union.count())
+            //update vertex
+            newCluster = cluster.leftJoin(union) {
+                (vid, old, newOps) =>
+                    newOps match {
+                        case None => old
+                        case Some(x) =>
+                            val y = x.distinct
+                            if (y.length == 1) {
+                                if (old._2.length == 1 && old._2.head == y.head)
+                                    old
+                                else
+                                    (mark + 1, y)
+                            } else {
+                                (mark + 1, y)
+                            }
+                    }
+            }
+            tmp.unpersist()
+            cluster.unpersist()
+            newCluster.cache()
+            cluster = newCluster
+            //cluster.checkpoint()
+            //those unchanged are filtered
+            tmp = cluster.filter(x => x._2._1 == (mark + 1)).cache()
+            val count = tmp.count()
+            if (count == preCount) {
+                tmp.unpersist()
+                continue = false
+            } else {
+                preCount = count
+            }
+
+            // val it = tmp.toLocalIterator
+            // while (it.hasNext) {
+            //     var item = it.next()
+            //     logWarning("item:" + item)
+            // }
+
+            logWarning("tmp count " + count)
+            iteration = iteration + 1
+        }
+
+        cluster.map(x => Array(x._1.toString, x._2._2.mkString(",")).mkString(",")).saveAsTextFile(dst)
+        merge(dst, dst + ".csv")
     }
 
     //获取节点属性（名称，发帖数量）//两种模式
@@ -310,7 +476,7 @@ object SubGraph {
      * 2562810123,1句实话,1
      */
     def combine_a(arg: RDD[Array[String]]): RDD[String] = {
-        val keyValue = arg.map(x => (x(0), (x(1), x(2).toInt)))
+        val keyValue = arg.filter(x => false == (x(1) == null || x(1).isEmpty)).map(x => (x(0), (x(1), x(2).toInt)))
         val combined = keyValue.reduceByKey((a, b) => (a._1, a._2 + b._2))
         combined.map(x => Array(x._1, x._2._1, x._2._2.toString).mkString(","))
     }
@@ -318,7 +484,7 @@ object SubGraph {
      * 02ba52da045f03d1c38d296520733a51,0,1句实话,1364258151,风声水早起,1
      */
     def combine_b(arg: RDD[Array[String]]): RDD[String] = {
-        val keyValue = arg.map(x => (x(0), (x(1), x(2), x(3), x(4), x(5).toInt)))
+        val keyValue = arg.filter(x => false == (x(2) == null || x(2).isEmpty || x(4) == null || x(4).isEmpty)).map(x => (x(0), (x(1), x(2), x(3), x(4), x(5).toInt)))
         val combined = keyValue.reduceByKey((a, b) => (a._1, a._2, a._3, a._4, a._5 + b._5))
         combined.map(x => Array(x._1, x._2._1, x._2._2, x._2._3, x._2._4, x._2._5.toString).mkString(","))
     }
@@ -334,6 +500,29 @@ object SubGraph {
         // val hdfs = FileSystem.get(hadoopConfig)
         val fs = FileSystem.getLocal(hadoopConfig)
         FileUtil.copyMerge(fs, new Path(srcPath), fs, new Path(dstPath), false, hadoopConfig, null)
+    }
+
+    /**
+     *   0 代表 b没有 a有
+     *   -1代表 a没有 b有
+     *   >1代表 a中重复的数据
+     */
+    def diff(sc: SparkContext, fa: String, fb: String, saving: String) {
+        val post_a = sc.textFile(fa).map(x => x.split(",").map(x => x.trim)).map(x => (x(1), 1))
+        val post_b = sc.textFile(fb).map(x => x.split(",").map(x => x.trim)).map(x => (x(1), 1)).reduceByKey((a, b) => a)
+        val join = post_a.fullOuterJoin(post_b).map {
+            case (id, (aOps, bOps)) =>
+                aOps match {
+                    case None => (id, -1)
+                    case Some(x) =>
+                        bOps match {
+                            case None => (id, 0)
+                            case Some(y) => (id, y)
+                        }
+                }
+        }
+        join.reduceByKey((a, b) => a + b).filter(x => x._2.toInt != 1).map(x => Array(x._1, x._2).mkString(",")).saveAsTextFile(saving)
+        merge(saving, saving + ".csv")
     }
 }
 
