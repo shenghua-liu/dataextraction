@@ -1,6 +1,7 @@
 import org.apache.spark.SparkContext
 import org.apache.spark.SparkContext._
 import org.apache.spark.SparkConf
+import org.apache.spark.storage.StorageLevel._
 import org.apache.spark.Logging
 import org.apache.spark.rdd.RDD
 import java.io.File
@@ -22,9 +23,9 @@ object SubGraph extends Logging {
     def main(args: Array[String]) {
 
         val conf = new SparkConf().setAppName("Components")
-
+        conf.set("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
         val sc = new SparkContext(conf)
-        sc.setCheckpointDir("/tmp")
+        // sc.setCheckpointDir("/tmp")
         if (args.length < 1) {
             println("【参数一】运行程序编号，【参数...】");
             return
@@ -68,6 +69,11 @@ object SubGraph extends Logging {
             case "7" => {
                 if (args.length == 3) {
                     hash2minComponents(sc, args(1), args(2))
+                }
+            }
+            case "8" => {
+                if (args.length == 5) {
+                    hash2min_format_result(sc, args(1), args(2), args(3), args(4))
                 }
             }
             case _ => {
@@ -256,15 +262,18 @@ object SubGraph extends Logging {
     def hash2minComponents(sc: SparkContext, src: String, dst: String) {
         logWarning("hash2min")
         val edge_tripl = sc.textFile(src)
-            .distinct(300)
+            // .distinct(300)
             .map { x =>
                 val arr = x.split(",").map(e => e.trim)
                 ((nameHash(arr(2)), arr(2)), (nameHash(arr(4)), arr(4)), x(5).toLong)
             }
-        val edges = edge_tripl.map {
+        val edges_pre = edge_tripl.map {
             case (src, dst, w) =>
                 Edge(src._1, dst._1, w)
         }
+
+        val edges = edges_pre.filter(x => x.srcId != x.dstId)
+
         val graph = Graph.fromEdges(edges, "")
         val init_vertices = graph.aggregateMessages[List[VertexId]](
             triplet => {
@@ -274,7 +283,7 @@ object SubGraph extends Logging {
             (a, b) => {
                 List.concat(a, b)
             })
-        var cluster: VertexRDD[(Int, List[VertexId])] = init_vertices.mapValues((vid, nbs) => (1, nbs ::: List(vid))).cache()
+        var cluster: VertexRDD[(Int, List[VertexId])] = init_vertices.mapValues((vid, nbs) => (1, nbs ::: List(vid))).persist(MEMORY_AND_DISK)
         //val maxInteration = Integer.max
         var iteration = 1
         var newCluster: VertexRDD[(Int, List[VertexId])] = null
@@ -330,11 +339,14 @@ object SubGraph extends Logging {
             }
             tmp.unpersist()
             cluster.unpersist()
-            newCluster.cache()
+            newCluster.persist(MEMORY_AND_DISK)
             cluster = newCluster
+            union_a.unpersist()
+            union_b.unpersist()
+            union.unpersist()
             //cluster.checkpoint()
             //those unchanged are filtered
-            tmp = cluster.filter(x => x._2._1 == (mark + 1)).cache()
+            tmp = cluster.filter(x => x._2._1 == (mark + 1)).persist(MEMORY_AND_DISK)
             val count = tmp.count()
             if (count == preCount) {
                 tmp.unpersist()
@@ -355,6 +367,61 @@ object SubGraph extends Logging {
 
         cluster.map(x => Array(x._1.toString, x._2._2.mkString(",")).mkString(",")).saveAsTextFile(dst)
         merge(dst, dst + ".csv")
+    }
+
+    def hash2min_format_result(sc: SparkContext, verticePath: String, edgePath: String, componentPath: String, dst: String) {
+        logWarning("format components !!!")
+        val edge_tripl = sc.textFile(edgePath)
+            .map { x =>
+                val arr = x.split(",").map(e => e.trim)
+                ((nameHash(arr(2)), arr(2)), (nameHash(arr(4)), arr(4)), x(5).toLong)
+            }
+        val vertices_dirty: RDD[(VertexId, String)] = edge_tripl.flatMap {
+            case (src, dst, w) =>
+                List((src._1, src._2), (dst._1, dst._2))
+        }
+        val vertices = vertices_dirty.reduceByKey((a, b) => a);
+        //从定点集文件获取属性
+        val vertice_file = sc.textFile(verticePath)
+        val vertices_weight_file = verticeWeightFromFile(vertice_file)
+        val vertices_weight = vertices.leftOuterJoin(vertices_weight_file).map {
+            case (id, (name, wOps)) =>
+                (id, (name, wOps.getOrElse(0L)))
+        }
+        val component_pre: RDD[(Long, Long)] = sc.textFile(componentPath).flatMap {
+            x =>
+                val arr = x.split(",").map(e => e.trim)
+                val label = arr(0).toLong
+                val head = arr(1).toLong
+                if (label <= head) {
+                    for (i <- 1 to arr.length - 1) yield (arr(i).toLong, label)
+                } else {
+                    List((0L, 0L))
+                }
+
+        }
+        val component = component_pre.filter(x => x._2 != 0L)
+        val group_piece = component.leftOuterJoin(vertices_weight).map {
+            case (node, (label, attrOps)) =>
+                val attr = attrOps.getOrElse(("None", 0L))
+                //label,(name,count)
+                (label, attr._1 + ":" + attr._2)
+        }
+        group_piece.persist(MEMORY_AND_DISK)
+        val group_count: RDD[(Long, Long)] = group_piece.mapValues(_ => 1L).reduceByKey(_ + _)
+        val group_member: RDD[(Long, String)] = group_piece.combineByKey(
+            (v: String) => List(v), //create combiner
+            (c: List[String], v: String) => v :: c, //combine c and v
+            (c1: List[String], c2: List[String]) => c1 ::: c2 //combine c and c
+            ).leftOuterJoin(group_count).map {
+                case (k, (c, countOps)) =>
+                    val count = countOps.getOrElse(0L)
+                    (count, c.mkString(","))
+            }
+        group_member.sortBy(x => x._1).map(x => Array(x._1, x._2).mkString(",")).saveAsTextFile(dst)
+        group_piece.unpersist()
+        merge(dst, dst + ".csv")
+
     }
 
     //获取节点属性（名称，发帖数量）//两种模式
@@ -441,7 +508,7 @@ object SubGraph extends Logging {
      *
      */
     def verticeWeightFromFile(file: RDD[String]): RDD[(VertexId, Long)] = {
-        file.map(x => x.split(",").map(e => e.trim)).map(x => (nameHash(x(1)), x(2).toLong))
+        file.map(x => x.split(",").map(e => e.trim)).map(x => (nameHash(x(1)), x(2).toLong)).reduceByKey((a, b) => a + b)
     }
 
     def extractEachComponentByEdges(labled_components: Graph[Long, Long]) {
